@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import random
-from models_mujoco import ActGen, StateGen
+# from models_mujoco import ActGen, StateGen
+from model import Policy, StateGen
 from baselines.common.segment_tree import SumSegmentTree, MinSegmentTree
 from utils_bw import select_mj, evaluate_mj, zero_mean_unit_std
 
@@ -104,8 +105,11 @@ class bw_module:
         self.action_shape = action_shape
         self.obs_shape = obs_shape
         #Create Backward models
-        self.bw_actgen = ActGen(self.obs_shape, self.action_shape)
-        self.bw_stategen = StateGen(self.obs_shape, self.action_shape)
+        # self.bw_actgen = ActGen(self.obs_shape, self.action_shape)
+        kwargs = {'hidden_size' : 128}
+        self.bw_actgen = Policy(obs_shape.shape, action_shape, kwargs)
+        # self.bw_stategen = StateGen(self.obs_shape, self.action_shape)
+        self.bw_stategen = StateGen(obs_shape.shape, action_shape, kwargs)
         if self.args.cuda:
             self.bw_actgen.cuda()
             self.bw_stategen.cuda()
@@ -115,7 +119,7 @@ class bw_module:
         
         #Create a forward model
         if self.args.consistency:
-            self.fw_stategen = StateGen(self.obs_shape, self.action_shape)
+            self.fw_stategen = StateGen(obs_shape.shape, action_shape, kwargs)
             if self.args.cuda:
                 self.fw_stategen.cuda()
             self.fw_optimizer = torch.optim.RMSprop(self.fw_stategen.parameters(), lr=self.args.lr, eps=self.args.eps, alpha=self.args.alpha)
@@ -160,20 +164,21 @@ class bw_module:
                 if self.args.per_weight:
                     weights = weights.cuda()
             # Train BW - Model
-            a_mu = self.bw_actgen(obs_next)
-            s_mu, s_sigma = self.bw_stategen(obs_next, actions)
-            s_sigma = torch.ones_like(s_mu)
-            a_sigma = torch.ones_like(a_mu)
-            if self.args.cuda:
-                a_sigma = a_sigma.cuda()
+            # a_mu = self.bw_actgen(obs_next)
+            _, action_log_probs, action_entropy, _ = self.bw_actgen.evaluate_actions(obs_next, None, None, actions)
+            state_log_probs, state_entropy = self.bw_stategen.evaluate_state_actions(obs_next, actions, obs_delta)
+            # s_mu, s_sigma = self.bw_stategen(obs_next, actions)
+            # s_sigma = torch.ones_like(s_mu)
+            # a_sigma = torch.ones_like(a_mu)
+            # if self.args.cuda:
+                # a_sigma = a_sigma.cuda()
             # Calculate Losses. Losses in terms of everything (mu,sigma,actions/obs_delta) noramlized only.
-            action_log_probs, action_entropy = evaluate_mj(self.args, a_mu, a_sigma, actions)
-            state_log_probs, state_entropy = evaluate_mj(self.args, s_mu, s_sigma, obs_delta)
+            # action_log_probs, action_entropy = evaluate_mj(a_mu, a_sigma, actions)
+            # state_log_probs, state_entropy = evaluate_mj(s_mu, s_sigma, obs_delta)
+            entropy_loss = self.args.entropy_coef*(action_entropy+state_entropy)
             if self.args.per_weight:
-                entropy_loss = self.args.entropy_coef*(torch.mean(action_entropy*weights)+torch.mean(state_entropy*weights))
                 total_loss = -torch.mean(action_log_probs*weights) - torch.mean(state_log_probs*weights) - entropy_loss
             else:
-                entropy_loss = self.args.entropy_coef*(action_entropy.mean()+state_entropy.mean())
                 total_loss = -torch.mean(action_log_probs) - torch.mean(state_log_probs) - entropy_loss
             self.bw_optimizer.zero_grad()
             total_loss.backward()
@@ -188,12 +193,14 @@ class bw_module:
 
             # Train FW - Model
             if self.args.consistency:
-                f_mu, f_sigma = self.fw_stategen(obs, actions)
-                log_probs, dist_entropy = evaluate_mj(self.args, f_mu, f_sigma, obs_next)
-                if self.args.per_weight:
-                    fw_loss = -torch.mean(log_probs*weights) - self.args.entropy_coef*torch.mean(dist_entropy*weights)
-                else:
-                    fw_loss = -torch.mean(log_probs) - self.args.entropy_coef*(dist_entropy.mean())
+                fstate_log_probs, fstate_entropy = self.bw_stategen.evaluate_state_actions(obs, actions, obs_next)
+                fw_loss = -fstate_log_probs.mean() - self.args.entropy_coef*fstate_entropy
+                # f_mu, f_sigma = self.fw_stategen(obs, actions)
+                # log_probs, dist_entropy = evaluate_mj(f_mu, f_sigma, obs_next)
+                # if self.args.per_weight:
+                #     fw_loss = -torch.mean(log_probs*weights) - self.args.entropy_coef*torch.mean(dist_entropy*weights)
+                # else:
+                #     fw_loss = -torch.mean(log_probs) - self.args.entropy_coef*(dist_entropy.mean())
                 self.fw_optimizer.zero_grad()
                 fw_loss.backward()
                 torch.nn.under.clip_grad_norm_(self.fw_stategen.parameters(), self.args.max_grad_norm)
@@ -207,82 +214,82 @@ class bw_module:
         else:
             return 0.0
 
-    def train_imitation(self, update):
-        """
-        Do these steps
-        1. Generate Recall traces from bw_model
-        2. Do imitation learning using those recall traces
-        """
-        # maintain list of sampled episodes(batchwise) and append to list. Then do Imitation learning simply
-        _ , _ , _ , states, _ , _ = self.sample_batch(self.args.num_states*1000)
-        if states is not None:
-            states_normalized = np.nan_to_num((states-self.obs_next_mean)/self.obs_next_std)
-            with torch.no_grad():
-                # self.actor_critic requires un-normalized states
-                states = torch.tensor(states, dtype=torch.float32)
-                states_normalized = torch.tensor(states_normalized, dtype=torch.float32)
-                if self.args.cuda:
-                    states = states.cuda()
-                    states_normalized = states_normalized.cuda()
-                value = self.actor_critic.get_value(states, None, None)
-                sorted_indices = value.cpu().numpy().reshape(-1).argsort()[-self.args.num_states:][::-1]
-            # Select high value states under currect valuation for target states_next
-            states_next = states[sorted_indices.tolist()]
-            states_next_normalized = states_normalized[sorted_indices.tolist()]
-            mb_actions, mb_states_prev = [], []
-            # Sample the Traces
-            for step in range(self.args.trace_size):
-                with torch.no_grad():
-                    a_mu = self.bw_actgen(states_next_normalized)
-                    a_sigma = torch.ones_like(a_mu)
-                    if self.args.cuda:
-                        a_sigma = a_sigma.cuda()
-                    actions = select_mj(a_mu, a_sigma)
-                    # Note these actions are normalized as StateGen takes in normalized actions(they were trained this way)
-                    # if self.args.cuda:
-                    #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
-                    # else:
-                    #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32) + torch.tensor(self.actions_mean, dtype=torch.float32)
-                    s_mu, s_sigma = self.bw_stategen(states_next_normalized, actions)
-                    s_sigma = torch.ones_like(s_mu)
-                    # s_t = s_t+1 + Δs_t
-                    delta_state = select_mj(s_mu, s_sigma)
-                    if self.args.cuda:
-                        delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32).cuda() + torch.tensor(self.obs_delta_mean, dtype=torch.float32).cuda()
-                    else:
-                        delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32) + torch.tensor(self.obs_delta_mean, dtype=torch.float32)
-                    states_prev = states_next + delta_state
-                    states_next = states_prev
-                    #np.nan_to_num not available in torch
-                    states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs_delta_mean)/self.obs_next_std)
-                    states_next_normalized = torch.tensor(states_next_normalized, dtype=torch.float32)
-                    if self.args.cuda:
-                        states_next_normalized = states_next_normalized.cuda()
-                # Add to list
-                mb_actions.append(actions.cpu().numpy())
-                mb_states_prev.append(states_prev.cpu().numpy())
-            # Begin to do Imitation Learning
-            mb_actions = torch.tensor(mb_actions, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
-            mb_states_prev = torch.tensor(mb_states_prev, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
-            if self.args.cuda:
-                mb_actions = mb_actions.cuda()
-                mb_states_prev = mb_states_prev.cuda()
-            _, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(mb_states_prev, None, None, mb_actions)
-            total_loss = -torch.mean(action_log_probs) - self.args.entropy_coef*dist_entropy
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.max_grad_norm)
-            self.optimizer.step()
+    # def train_imitation(self, update):
+    #     """
+    #     Do these steps
+    #     1. Generate Recall traces from bw_model
+    #     2. Do imitation learning using those recall traces
+    #     """
+    #     # maintain list of sampled episodes(batchwise) and append to list. Then do Imitation learning simply
+    #     _ , _ , _ , states, _ , _ = self.sample_batch(self.args.num_states*1000)
+    #     if states is not None:
+    #         states_normalized = np.nan_to_num((states-self.obs_next_mean)/self.obs_next_std)
+    #         with torch.no_grad():
+    #             # self.actor_critic requires un-normalized states
+    #             states = torch.tensor(states, dtype=torch.float32)
+    #             states_normalized = torch.tensor(states_normalized, dtype=torch.float32)
+    #             if self.args.cuda:
+    #                 states = states.cuda()
+    #                 states_normalized = states_normalized.cuda()
+    #             value = self.actor_critic.get_value(states, None, None)
+    #             sorted_indices = value.cpu().numpy().reshape(-1).argsort()[-self.args.num_states:][::-1]
+    #         # Select high value states under currect valuation for target states_next
+    #         states_next = states[sorted_indices.tolist()]
+    #         states_next_normalized = states_normalized[sorted_indices.tolist()]
+    #         mb_actions, mb_states_prev = [], []
+    #         # Sample the Traces
+    #         for step in range(self.args.trace_size):
+    #             with torch.no_grad():
+    #                 a_mu = self.bw_actgen(states_next_normalized)
+    #                 a_sigma = torch.ones_like(a_mu)
+    #                 if self.args.cuda:
+    #                     a_sigma = a_sigma.cuda()
+    #                 actions = select_mj(a_mu, a_sigma)
+    #                 # Note these actions are normalized as StateGen takes in normalized actions(they were trained this way)
+    #                 # if self.args.cuda:
+    #                 #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
+    #                 # else:
+    #                 #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32) + torch.tensor(self.actions_mean, dtype=torch.float32)
+    #                 s_mu, s_sigma = self.bw_stategen(states_next_normalized, actions)
+    #                 s_sigma = torch.ones_like(s_mu)
+    #                 # s_t = s_t+1 + Δs_t
+    #                 delta_state = select_mj(s_mu, s_sigma)
+    #                 if self.args.cuda:
+    #                     delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32).cuda() + torch.tensor(self.obs_delta_mean, dtype=torch.float32).cuda()
+    #                 else:
+    #                     delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32) + torch.tensor(self.obs_delta_mean, dtype=torch.float32)
+    #                 states_prev = states_next + delta_state
+    #                 states_next = states_prev
+    #                 #np.nan_to_num not available in torch
+    #                 states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs_delta_mean)/self.obs_next_std)
+    #                 states_next_normalized = torch.tensor(states_next_normalized, dtype=torch.float32)
+    #                 if self.args.cuda:
+    #                     states_next_normalized = states_next_normalized.cuda()
+    #             # Add to list
+    #             mb_actions.append(actions.cpu().numpy())
+    #             mb_states_prev.append(states_prev.cpu().numpy())
+    #         # Begin to do Imitation Learning
+    #         mb_actions = torch.tensor(mb_actions, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
+    #         mb_states_prev = torch.tensor(mb_states_prev, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
+    #         if self.args.cuda:
+    #             mb_actions = mb_actions.cuda()
+    #             mb_states_prev = mb_states_prev.cuda()
+    #         _, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(mb_states_prev, None, None, mb_actions)
+    #         total_loss = -torch.mean(action_log_probs) - self.args.entropy_coef*dist_entropy
+    #         self.optimizer.zero_grad()
+    #         total_loss.backward()
+    #         torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.max_grad_norm)
+    #         self.optimizer.step()
 
-            # Do the Consistency Bit
-            if self.args.consistency:
-                print('foo')
-            else:
-                return total_loss.item()
-        elif self.args.consistency:
-            return 0.0, 0.0
-        else:
-            return 0.0
+    #         # Do the Consistency Bit
+    #         if self.args.consistency:
+    #             print('foo')
+    #         else:
+    #             return total_loss.item()
+    #     elif self.args.consistency:
+    #         return 0.0, 0.0
+    #     else:
+    #         return 0.0
 
     def step(self, obs, actions, rewards, dones, obs_next):
         """

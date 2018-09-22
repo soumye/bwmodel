@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from distributions import Categorical, DiagGaussian
 from utils import init, init_normc_
 
@@ -207,3 +206,62 @@ class MLPBase(NNBase):
         hidden_actor = self.actor(x)
 
         return self.critic_linear(hidden_critic), hidden_actor, rnn_hxs
+
+class StateGen(nn.Module):
+    def __init__(self, obs_shape, action_space, base_kwargs=None):
+        super(StateGen, self).__init__()
+        if base_kwargs is None:
+            base_kwargs = {}
+
+        if len(obs_shape) == 1:
+            self.base = StateMLPBase(obs_shape[0] + action_space.shape[0], **base_kwargs)
+        else:
+            raise NotImplementedError
+
+        if action_space.__class__.__name__ == "Box":
+            num_outputs = obs_shape[0]
+            self.dist = DiagGaussian(self.base.hidden_size, num_outputs)
+        else:
+            raise NotImplementedError
+
+    def act(self, obs, actions, deterministic=False):
+        state_features = self.base(obs, actions)
+        dist = self.dist(state_features)
+
+        if deterministic:
+            state = dist.mode()
+        else:
+            state = dist.sample()
+
+        state_log_probs = dist.log_probs(state)
+        return action, state_log_probs
+
+
+    def evaluate_state_actions(self, obs, actions, obs_target):
+        state_features = self.base(obs, actions)
+        dist = self.dist(state_features)
+
+        state_log_probs = dist.log_probs(obs_target)
+        dist_entropy = dist.entropy().mean()
+
+        return state_log_probs, dist_entropy
+
+class StateMLPBase(nn.Module):
+    def __init__(self, num_inputs, hidden_size=128):
+        super(StateMLPBase, self).__init__()
+        self.hidden_size = hidden_size
+        init_ = lambda m: init(m,
+            init_normc_,
+            lambda x: nn.init.constant_(x, 0))
+
+        self.actor = nn.Sequential(
+            init_(nn.Linear(num_inputs, hidden_size)),
+            nn.ReLU(),
+            init_(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU()
+        )
+        self.train()
+
+    def forward(self, obs, actions):
+        x = torch.cat((obs, actions),1)
+        return self.actor(x)

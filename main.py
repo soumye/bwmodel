@@ -146,8 +146,8 @@ def main():
                 for _ in range(args.n_bw):
                     l_bw += bw_model.train_bw_model(j)
                 l_bw /= args.n_bw
-                for _ in range(args.n_imi):
-                    l_imi += bw_model.train_imitation(j)
+                # for _ in range(args.n_imi):
+                #     l_imi += bw_model.train_imitation(j)
                 l_imi /= args.n_imi
             else:
                 l_bw, l_fw = 0.0, 0.0

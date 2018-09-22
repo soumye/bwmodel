@@ -76,7 +76,7 @@ def get_args():
     parser.add_argument('--consistency', action='store_true', help='For consistency bw forward and backward model')
     parser.add_argument('--logclip', type=float, default=4.0, help = 'Clipping for log Normal')
     parser.add_argument('--n-a2c', type=int, default=5, help='Number of a2c updates after which to do bw update')
-    parser.add_argument('--n-bw', type=int, default=80, help='Number of bw updates to do per n-a2c updates')
+    parser.add_argument('--n-bw', type=int, default=100, help='Number of bw updates to do per n-a2c updates')
     parser.add_argument('--n-imi', type=int, default=5, help='Number of imitation updates to do per n-a2c updates')
     
     args = parser.parse_args()
