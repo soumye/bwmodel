@@ -6,7 +6,7 @@ import numpy as np
 import random
 from models_mujoco import ActGen, StateGen
 from baselines.common.segment_tree import SumSegmentTree, MinSegmentTree
-from utils import evaluate_actions_sil, select_mj, evaluate_mj, zero_mean_unit_std
+from utils_bw import select_mj, evaluate_mj, zero_mean_unit_std
 
 class ReplayBuffer:
     """
@@ -97,9 +97,9 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         return tuple(list(encoded_sample) + [weights, idxes])
 
 class bw_module:
-    def __init__(self, network, args, optimizer, action_shape, obs_shape):
+    def __init__(self, actor_critic, args, optimizer, action_shape, obs_shape):
         self.args = args
-        self.network = network
+        self.actor_critic = actor_critic
         self.optimizer = optimizer
         self.action_shape = action_shape
         self.obs_shape = obs_shape
@@ -182,7 +182,7 @@ class bw_module:
 
             #Now updating the priorities in the PER Buffer. Use Net Value estimates
             with torch.no_grad():
-                value, _, _ = self.network(obs_next_unnormalized)
+                value = self.actor_critic.get_value(obs_next_unnormalized, None, None)
             value = torch.clamp(value, min=0)
             self.buffer.update_priorities(idxes, value.squeeze(1).cpu().numpy())
 
@@ -214,34 +214,36 @@ class bw_module:
         2. Do imitation learning using those recall traces
         """
         # maintain list of sampled episodes(batchwise) and append to list. Then do Imitation learning simply
-        _ , _ , _ , states, _ , _ = self.sample_batch(self.args.num_states*5)
+        _ , _ , _ , states, _ , _ = self.sample_batch(self.args.num_states*1000)
         if states is not None:
-            states_preprocessed = np.nan_to_num((states-self.obs_next_mean)/self.obs_next_std)
+            states_normalized = np.nan_to_num((states-self.obs_next_mean)/self.obs_next_std)
             with torch.no_grad():
-                # self.network requires un-normalized states
+                # self.actor_critic requires un-normalized states
                 states = torch.tensor(states, dtype=torch.float32)
-                states_preprocessed = torch.tensor(states_preprocessed, dtype=torch.float32)
+                states_normalized = torch.tensor(states_normalized, dtype=torch.float32)
                 if self.args.cuda:
                     states = states.cuda()
-                    states_preprocessed = states_preprocessed.cuda()
-                value, _, _ = self.network(states)
+                    states_normalized = states_normalized.cuda()
+                value = self.actor_critic.get_value(states, None, None)
                 sorted_indices = value.cpu().numpy().reshape(-1).argsort()[-self.args.num_states:][::-1]
             # Select high value states under currect valuation for target states_next
             states_next = states[sorted_indices.tolist()]
-            states_next_preprocessed = states_preprocessed[sorted_indices.tolist()]
+            states_next_normalized = states_normalized[sorted_indices.tolist()]
             mb_actions, mb_states_prev = [], []
+            # Sample the Traces
             for step in range(self.args.trace_size):
                 with torch.no_grad():
-                    a_mu = self.bw_actgen(states_next_preprocessed)
+                    a_mu = self.bw_actgen(states_next_normalized)
                     a_sigma = torch.ones_like(a_mu)
                     if self.args.cuda:
                         a_sigma = a_sigma.cuda()
                     actions = select_mj(a_mu, a_sigma)
+                    # Note these actions are normalized as StateGen takes in normalized actions(they were trained this way)
                     # if self.args.cuda:
                     #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
                     # else:
                     #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32) + torch.tensor(self.actions_mean, dtype=torch.float32)
-                    s_mu, s_sigma = self.bw_stategen(states_next_preprocessed, actions)
+                    s_mu, s_sigma = self.bw_stategen(states_next_normalized, actions)
                     s_sigma = torch.ones_like(s_mu)
                     # s_t = s_t+1 + Δs_t
                     delta_state = select_mj(s_mu, s_sigma)
@@ -252,10 +254,10 @@ class bw_module:
                     states_prev = states_next + delta_state
                     states_next = states_prev
                     #np.nan_to_num not available in torch
-                    states_next_preprocessed = np.nan_to_num((states_next.cpu().numpy() - self.obs_delta_mean)/self.obs_next_std)
-                    states_next_preprocessed = torch.tensor(states_next_preprocessed, dtype=torch.float32)
+                    states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs_delta_mean)/self.obs_next_std)
+                    states_next_normalized = torch.tensor(states_next_normalized, dtype=torch.float32)
                     if self.args.cuda:
-                        states_next_preprocessed = states_next_preprocessed.cuda()
+                        states_next_normalized = states_next_normalized.cuda()
                 # Add to list
                 mb_actions.append(actions.cpu().numpy())
                 mb_states_prev.append(states_prev.cpu().numpy())
@@ -265,16 +267,11 @@ class bw_module:
             if self.args.cuda:
                 mb_actions = mb_actions.cuda()
                 mb_states_prev = mb_states_prev.cuda()
-            _, mu, sigma = self.network(mb_states_prev)
-            try:
-                action_log_probs, dist_entropy = evaluate_mj(self.args, mu, sigma, mb_actions)
-            except:
-                print(mu, sigma)
-                import ipdb;ipdb.set_trace()
-            total_loss = -torch.mean(action_log_probs) - - self.args.entropy_coef*(dist_entropy.mean())
+            _, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(mb_states_prev, None, None, mb_actions)
+            total_loss = -torch.mean(action_log_probs) - self.args.entropy_coef*dist_entropy
             self.optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.max_grad_norm)
             self.optimizer.step()
 
             # Do the Consistency Bit

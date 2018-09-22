@@ -19,6 +19,8 @@ from storage import RolloutStorage
 from utils import get_vec_normalize
 from visualize import visdom_plot
 
+from bw_module_mujoco import bw_module
+
 args = get_args()
 
 assert args.algo in ['a2c', 'ppo', 'acktr']
@@ -56,7 +58,9 @@ def main():
     if args.vis:
         from visdom import Visdom
         viz = Visdom(port=args.port)
+        vizz = Visdom(port=args.port)
         win = None
+        winloss = None
 
     envs = make_vec_envs(args.env_name, args.seed, args.num_processes,
                         args.gamma, args.log_dir, args.add_timestep, device, False)
@@ -82,7 +86,12 @@ def main():
     rollouts = RolloutStorage(args.num_steps, args.num_processes,
                         envs.observation_space.shape, envs.action_space,
                         actor_critic.recurrent_hidden_state_size)
-
+    #Initialize bw Model
+    if args.bw:
+        bw_model = bw_module(actor_critic, args, agent.optimizer, envs.action_space, envs.observation_space)
+    vis_timesteps = []
+    vis_loss = []
+    
     obs = envs.reset()
     rollouts.obs[0].copy_(obs)
     rollouts.to(device)
@@ -111,6 +120,14 @@ def main():
                                        for done_ in done])
             rollouts.insert(obs, recurrent_hidden_states, action, action_log_prob, value, reward, masks)
 
+            # Add stuff to the Buffer
+            if args.bw:
+                bw_model.step(rollouts.obs[step].detach().cpu().numpy(),
+                            action.detach().cpu().numpy(),
+                            reward.detach().cpu().numpy(),
+                            done,
+                            obs.detach().cpu().numpy())
+        
         with torch.no_grad():
             next_value = actor_critic.get_value(rollouts.obs[-1],
                                                 rollouts.recurrent_hidden_states[-1],
@@ -121,6 +138,32 @@ def main():
         value_loss, action_loss, dist_entropy = agent.update(rollouts)
 
         rollouts.after_update()
+
+        # Do BW STEPS
+        if args.bw and (j % args.n_a2c == 0):
+            if not args.consistency:
+                l_bw, l_imi = 0.0, 0.0
+                for _ in range(args.n_bw):
+                    l_bw += bw_model.train_bw_model(j)
+                l_bw /= args.n_bw
+                for _ in range(args.n_imi):
+                    l_imi += bw_model.train_imitation(j)
+                l_imi /= args.n_imi
+            else:
+                l_bw, l_fw = 0.0, 0.0
+                for _ in range(args.n_bw):
+                    l_bw_, l_fw_ = bw_model.train_bw_model(j)
+                    l_bw += l_bw_
+                    l_fw += l_fw_
+                l_bw /= args.n_bw
+                l_fw /= args.n_bw
+                l_imi, l_cons = 0.0, 0.0
+                for _ in range(args.n_imi):
+                    l_imi_, l_cons_ = bw_model.train_imitation(j)
+                    l_imi += l_imi_
+                    l_cons_ += l_cons_
+                l_imi /= args.n_imi
+                l_cons /= args.n_imi
 
         if j % args.save_interval == 0 and args.save_dir != "":
             save_path = os.path.join(args.save_dir, args.algo)
@@ -195,11 +238,42 @@ def main():
         if args.vis and j % args.vis_interval == 0:
             try:
                 # Sometimes monitor doesn't properly flush the outputs
-                win = visdom_plot(viz, win, args.log_dir, args.env_name,
+                env_name = args.env_name
+                if args.bw:
+                    env_name += 'BW'
+                win = visdom_plot(viz, win, args.log_dir, env_name,
                                   args.algo, args.num_frames)
             except IOError:
                 pass
 
+        # Save to Visdom Plots
+        if args.vis and (j % args.vis_interval == 0):
+            if args.bw and args.consistency:
+                vis_loss.append([value_loss, action_loss, l_bw, l_imi, l_fw, l_cons])
+                legend=['Value loss','Action loss', 'BW Loss','IMI loss', 'CONST loss']
+                title = args.env_name + '-' + 'bw' + '-' + 'consistency'
+            elif args.bw:
+                vis_loss.append([value_loss, action_loss, l_bw, l_imi])
+                legend=['Value loss','Action loss', 'BW Loss','IMI loss']
+                title = args.env_name + '-' + 'bw'
+            else:
+                vis_loss.append([value_loss, action_loss])
+                legend=['Value loss','Action loss']
+                title = args.env_name + '-' + 'vanilla'
+            vis_timesteps.append((j+1)*(args.num_processes * args.num_steps))
+            # vis_rewards.append(final_rewards.mean())
+            # vis_rewards.append(np.mean(reward_queue))
+            
+            # if win is None:
+            #     win = vizz.line(Y=np.array(vis_rewards), X=np.array(vis_timesteps), opts=dict(title=title, xlabel='Timesteps',
+            #                 ylabel='Avg Rewards'))
+            # vizz.line(Y=np.array(vis_rewards), X=np.array(vis_timesteps), win=win, update='replace', opts=dict(title=title, xlabel='Timesteps',
+            #                 ylabel='Avg Rewards'))
+            if winloss is None:
+                winloss = vizz.line(Y=np.array(vis_loss), X=np.array(vis_timesteps), opts=dict(title=title, xlabel='Timesteps',
+                            ylabel='Losses', legend=legend))
+            vizz.line(Y=np.array(vis_loss), X=np.array(vis_timesteps), win=winloss, update='replace', opts=dict(title=title, xlabel='Timesteps',
+                            ylabel='Losses', legend=legend))
 
 if __name__ == "__main__":
     main()
