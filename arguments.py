@@ -63,6 +63,21 @@ def get_args():
                         help='enable visdom visualization')
     parser.add_argument('--port', type=int, default=8097,
                         help='port to run the server on (default: 8097)')
+    # Buffer Params for SIL and BW
+    parser.add_argument('--capacity', type=int, default=100000, help='the capacity of the replay buffer')
+    parser.add_argument('--sil-alpha', type=float, default=0.6, help='the exponent for PER')
+    parser.add_argument('--sil-beta', type=float, default=0.1, help='sil beta')
+    # BW Specific Args
+    parser.add_argument('--k-states', type=int, default=32, help='Number of top value states to train Backtracking Model on')
+    parser.add_argument('--num-states', type=int, default=1, help='Number of high value state to actually backtrack on')
+    parser.add_argument('--trace-size', type=int, default=3, help='Number of steps to backtrack on for a given high value state ie length of trajectory')
+    parser.add_argument('--per-weight', action='store_true', help='weigh the lossed based on PER weights')
+    parser.add_argument('--consistency', action='store_true', help='For consistency bw forward and backward model')
+    parser.add_argument('--logclip', type=float, default=4.0, help = 'Clipping for log Normal')
+    parser.add_argument('--n-a2c', type=int, default=5, help='Number of a2c updates after which to do bw update')
+    parser.add_argument('--n-bw', type=int, default=20, help='Number of bw updates to do per n-a2c updates')
+    parser.add_argument('--n-imi', type=int, default=1, help='Number of imitation updates to do per n-a2c updates')
+    
     args = parser.parse_args()
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
