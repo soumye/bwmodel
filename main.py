@@ -255,7 +255,7 @@ def main():
             elif args.bw:
                 vis_loss.append([value_loss, action_loss, l_bw, l_imi])
                 legend=['Value loss','Action loss', 'BW Loss','IMI loss']
-                title = args.env_name + '-' + 'bw'
+                title = args.env_name + '-' + 'bw' + args.title
             else:
                 vis_loss.append([value_loss, action_loss])
                 legend=['Value loss','Action loss']
