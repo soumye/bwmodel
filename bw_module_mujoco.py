@@ -114,8 +114,8 @@ class bw_module:
             self.bw_actgen.cuda()
             self.bw_stategen.cuda()
         self.bw_params = list(self.bw_actgen.parameters()) + list(self.bw_stategen.parameters())
-        self.bw_optimizer = torch.optim.RMSprop(self.bw_params, lr=self.args.lr, eps=self.args.eps, alpha=self.args.alpha)
-        # self.bw_optimizer = torch.optim.Adam(self.bw_params, lr=self.args.lr)
+        self.bw_optimizer = torch.optim.RMSprop(self.bw_params, lr=1e-3, eps=self.args.eps, alpha=self.args.alpha)
+        # self.bw_optimizer = torch.optim.Adam(self.bw_params, lr=1e-3)
         
         #Create a forward model
         if self.args.consistency:
@@ -126,7 +126,10 @@ class bw_module:
             # self.fw_optimizer = torch.optim.Adam(self.fw_stategen.parameters(), lr=self.args.lr)
         #Create an episode buffer of size : # processes
         self.running_episodes = [[] for _ in range(self.args.num_processes)]
-        self.buffer = PrioritizedReplayBuffer(self.args.capacity, self.args.sil_alpha)
+        if self.args.per_weight:
+            self.buffer = PrioritizedReplayBuffer(self.args.capacity, self.args.sil_alpha)
+        else:
+            self.buffer = ReplayBuffer(self.args.capacity)
         # some other parameters...
         self.total_steps = []
         self.total_rewards = []
@@ -142,9 +145,28 @@ class bw_module:
         """
         Train the bw_model. Sample (s,a,r,s) from PER Buffer, Compute bw_model loss & Optimize
         """
-        obs, actions, _, obs_next_unnormalized, weights, idxes = self.sample_batch(self.args.k_states)
+        if self.args.per_weight:
+            obs, actions, _, obs_next_unnormalized, weights, idxes = self.sample_batch(self.args.k_states)
+        else:
+            obs, actions, _, obs_next_unnormalized = self.sample_batch_noper(10*self.args.k_states)
         batch_size = min(self.args.k_states, len(self.buffer))
         if obs is not None and obs_next_unnormalized is not None:
+            if not self.args.per_weight:
+                with torch.no_grad():
+                    # self.actor_critic requires un-normalized states
+                    obs_next_unnormalized = torch.tensor(obs_next_unnormalized, dtype=torch.float32)
+                    # states_normalized = torch.tensor(states_normalized, dtype=torch.float32)
+                    if self.args.cuda:
+                        obs_next_unnormalized = obs_next_unnormalized.cuda()
+                        # states_normalized = states_normalized.cuda()
+                    value = self.actor_critic.get_value(obs_next_unnormalized, None, None)
+                    sorted_indices = value.cpu().numpy().reshape(-1).argsort()[-batch_size:][::-1]
+                    obs_next_unnormalized = obs_next_unnormalized.cpu().numpy()
+                # Select high value states under currect valuation for target states_next
+                obs = obs[sorted_indices.tolist()]
+                obs_next_unnormalized = obs_next_unnormalized[sorted_indices.tolist()]
+                actions = actions[sorted_indices.tolist()]
+
             obs_delta, self.obs_delta_mean, self.obs_delta_std = zero_mean_unit_std(obs-obs_next_unnormalized)
             actions, self.actions_mean, self.actions_std = zero_mean_unit_std(actions)
             obs_next, self.obs_next_mean, self.obs_next_std = zero_mean_unit_std(obs_next_unnormalized)
@@ -164,32 +186,37 @@ class bw_module:
                 if self.args.per_weight:
                     weights = weights.cuda()
             # Train BW - Model
-            # a_mu = self.bw_actgen(obs_next)
-            _, action_log_probs, action_entropy, _ = self.bw_actgen.evaluate_actions(obs_next, None, None, actions)
-            state_log_probs, state_entropy = self.bw_stategen.evaluate_state_actions(obs_next, actions, obs_delta)
-            # s_mu, s_sigma = self.bw_stategen(obs_next, actions)
-            # s_sigma = torch.ones_like(s_mu)
-            # a_sigma = torch.ones_like(a_mu)
-            # if self.args.cuda:
-                # a_sigma = a_sigma.cuda()
-            # Calculate Losses. Losses in terms of everything (mu,sigma,actions/obs_delta) noramlized only.
-            # action_log_probs, action_entropy = evaluate_mj(a_mu, a_sigma, actions)
-            # state_log_probs, state_entropy = evaluate_mj(s_mu, s_sigma, obs_delta)
-            entropy_loss = self.args.entropy_coef*(action_entropy+state_entropy)
-            if self.args.per_weight:
-                total_loss = -torch.mean(action_log_probs*weights) - torch.mean(state_log_probs*weights) - entropy_loss
-            else:
-                total_loss = -torch.mean(action_log_probs) - torch.mean(state_log_probs) - entropy_loss
-            self.bw_optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.bw_params, self.args.max_grad_norm)
-            self.bw_optimizer.step()
+            avg_loss = 0
+            for _ in range(20):
+                # a_mu = self.bw_actgen(obs_next)
+                _, action_log_probs, action_entropy, _ = self.bw_actgen.evaluate_actions(obs_next, None, None, actions)
+                state_log_probs, state_entropy = self.bw_stategen.evaluate_state_actions(obs_next, actions, obs_delta)
+                # s_mu, s_sigma = self.bw_stategen(obs_next, actions)
+                # s_sigma = torch.ones_like(s_mu)
+                # a_sigma = torch.ones_like(a_mu)
+                # if self.args.cuda:
+                    # a_sigma = a_sigma.cuda()
+                # Calculate Losses. Losses in terms of everything (mu,sigma,actions/obs_delta) noramlized only.
+                # action_log_probs, action_entropy = evaluate_mj(a_mu, a_sigma, actions)
+                # state_log_probs, state_entropy = evaluate_mj(s_mu, s_sigma, obs_delta)
+                entropy_loss = self.args.entropy_coef*(action_entropy+state_entropy)
+                if self.args.per_weight:
+                    total_loss = -torch.mean(action_log_probs*weights) - torch.mean(state_log_probs*weights) - entropy_loss
+                else:
+                    total_loss = -torch.mean(action_log_probs) - torch.mean(state_log_probs) - entropy_loss
+                self.bw_optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.bw_params, self.args.max_grad_norm)
+                self.bw_optimizer.step()
+                avg_loss += total_loss.item()
+            avg_loss /= 20
 
             #Now updating the priorities in the PER Buffer. Use Net Value estimates
-            with torch.no_grad():
-                value = self.actor_critic.get_value(obs_next_unnormalized, None, None)
-            value = torch.clamp(value, min=0)
-            self.buffer.update_priorities(idxes, value.squeeze(1).cpu().numpy())
+            if self.args.per_weight:
+                with torch.no_grad():
+                    value = self.actor_critic.get_value(obs_next_unnormalized, None, None)
+                value = torch.clamp(value, min=0)
+                self.buffer.update_priorities(idxes, value.squeeze(1).cpu().numpy())
 
             # Train FW - Model
             if self.args.consistency:
@@ -207,7 +234,7 @@ class bw_module:
                 self.fw_optimizer.step()
                 return total_loss.item(), fw_loss.item()
             else:
-                return total_loss.item()
+                return avg_loss
 
         elif self.args.consistency:
             return 0.0, 0.0
@@ -364,6 +391,13 @@ class bw_module:
         if len(self.buffer) > 100:
             batch_size = min(batch_size, len(self.buffer))
             return self.buffer.sample(batch_size, beta=self.args.sil_beta)
+        else:
+            return None, None, None, None, None, None
+    
+    def sample_batch_noper(self, batch_size):
+        if len(self.buffer) > 100:
+            batch_size = min(batch_size, len(self.buffer))
+            return self.buffer.sample(batch_size)
         else:
             return None, None, None, None, None, None
 
