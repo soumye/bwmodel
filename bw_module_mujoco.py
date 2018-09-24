@@ -291,13 +291,13 @@ class bw_module:
                     # actions = select_mj(a_mu, a_sigma)
                     _, actions, _, _ = self.bw_actgen.act(states_next_normalized, None, None)
                     # Note these actions are normalized as StateGen takes in normalized actions(they were trained this way)
-                    # if self.args.cuda:
-                    #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
-                    # else:
-                    #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32) + torch.tensor(self.actions_mean, dtype=torch.float32)
                     # s_mu, s_sigma = self.bw_stategen(states_next_normalized, actions)
                     # s_sigma = torch.ones_like(s_mu)
                     delta_state, _ = self.bw_stategen.act(states_next_normalized, actions)
+                    if self.args.cuda:
+                        actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
+                    else:
+                        actions = actions*torch.tensor(self.actions_std, dtype=torch.float32) + torch.tensor(self.actions_mean, dtype=torch.float32)
                     # s_t = s_t+1 + Δs_t
                     # delta_state = select_mj(s_mu, s_sigma)
                     if self.args.cuda:
@@ -307,7 +307,7 @@ class bw_module:
                     states_prev = states_next + delta_state
                     states_next = states_prev
                     #np.nan_to_num not available in torch
-                    states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs_delta_mean)/self.obs_next_std)
+                    states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs__mean)/self.obs_next_std)
                     states_next_normalized = torch.tensor(states_next_normalized, dtype=torch.float32)
                     if self.args.cuda:
                         states_next_normalized = states_next_normalized.cuda()
