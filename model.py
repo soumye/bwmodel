@@ -234,7 +234,7 @@ class StateGen(nn.Module):
             state = dist.sample()
 
         state_log_probs = dist.log_probs(state)
-        return action, state_log_probs
+        return state, state_log_probs
 
 
     def evaluate_state_actions(self, obs, actions, obs_target):

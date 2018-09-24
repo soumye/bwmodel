@@ -146,8 +146,8 @@ def main():
                 for _ in range(args.n_bw):
                     l_bw += bw_model.train_bw_model(j)
                 l_bw /= args.n_bw
-                # for _ in range(args.n_imi):
-                #     l_imi += bw_model.train_imitation(j)
+                for _ in range(args.n_imi):
+                    l_imi += bw_model.train_imitation(j)
                 l_imi /= args.n_imi
             else:
                 l_bw, l_fw = 0.0, 0.0
@@ -250,8 +250,8 @@ def main():
         if args.vis and (j % args.vis_interval == 0):
             if args.bw and args.consistency:
                 vis_loss.append([value_loss, action_loss, l_bw, l_imi, l_fw, l_cons])
-                legend=['Value loss','Action loss', 'BW Loss','IMI loss', 'CONST loss']
-                title = args.env_name + '-' + 'bw' + '-' + 'consistency'
+                legend=['Value loss','Action loss', 'BW Loss','IMI loss','FW Loss', 'CONST loss']
+                title = args.env_name + '-' + 'bw' + '-' + 'consistency' + args.title
             elif args.bw:
                 vis_loss.append([value_loss, action_loss, l_bw, l_imi])
                 legend=['Value loss','Action loss', 'BW Loss','IMI loss']

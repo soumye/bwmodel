@@ -130,6 +130,7 @@ class bw_module:
             self.buffer = PrioritizedReplayBuffer(self.args.capacity, self.args.sil_alpha)
         else:
             self.buffer = ReplayBuffer(self.args.capacity)
+            # self.bufferold = ReplayBuffer(10*self.args.capacity)
         # some other parameters...
         self.total_steps = []
         self.total_rewards = []
@@ -138,6 +139,8 @@ class bw_module:
         self.obs_delta_std = None
         self.obs_next_mean = None
         self.obs_next_std = None
+        self.obs_mean = None
+        self.obs_std = None
         self.actions_mean = None
         self.actions_std = None
 
@@ -148,7 +151,7 @@ class bw_module:
         if self.args.per_weight:
             obs, actions, _, obs_next_unnormalized, weights, idxes = self.sample_batch(self.args.k_states)
         else:
-            obs, actions, _, obs_next_unnormalized = self.sample_batch_noper(10*self.args.k_states)
+            obs, actions, returns, obs_next_unnormalized = self.sample_batch_noper(self.args.capacity)
         batch_size = min(self.args.k_states, len(self.buffer))
         if obs is not None and obs_next_unnormalized is not None:
             if not self.args.per_weight:
@@ -166,20 +169,26 @@ class bw_module:
                 obs = obs[sorted_indices.tolist()]
                 obs_next_unnormalized = obs_next_unnormalized[sorted_indices.tolist()]
                 actions = actions[sorted_indices.tolist()]
+                returns = returns[sorted_indices.tolist()]
+                # for (ob, action, R, ob_next) in list(zip(obs, actions, returns, obs_next_unnormalized)):
+                #     self.buffer_old.add(ob, action, R, ob_next)
 
             obs_delta, self.obs_delta_mean, self.obs_delta_std = zero_mean_unit_std(obs-obs_next_unnormalized)
             actions, self.actions_mean, self.actions_std = zero_mean_unit_std(actions)
+            obs, self.obs_mean, self.obs_std = zero_mean_unit_std(obs)
             obs_next, self.obs_next_mean, self.obs_next_std = zero_mean_unit_std(obs_next_unnormalized)
             # need to get the masks
             # get basic information of network..
             obs_delta = torch.tensor(obs_delta, dtype=torch.float32)
             obs_next = torch.tensor(obs_next, dtype=torch.float32)
+            obs = torch.tensor(obs, dtype=torch.float32)
             obs_next_unnormalized = torch.tensor(obs_next_unnormalized, dtype=torch.float32)
             actions = torch.tensor(actions, dtype=torch.float32)
             if self.args.per_weight:
                 weights = torch.tensor(weights, dtype=torch.float32).unsqueeze(1)
             if self.args.cuda:
                 obs_delta = obs_delta.cuda()
+                obs = obs.cuda()
                 obs_next = obs_next.cuda()
                 obs_next_unnormalized = obs_next_unnormalized.cuda()
                 actions = actions.cuda()
@@ -187,7 +196,7 @@ class bw_module:
                     weights = weights.cuda()
             # Train BW - Model
             avg_loss = 0
-            for _ in range(20):
+            for _ in range(self.args.epoch):
                 # a_mu = self.bw_actgen(obs_next)
                 _, action_log_probs, action_entropy, _ = self.bw_actgen.evaluate_actions(obs_next, None, None, actions)
                 state_log_probs, state_entropy = self.bw_stategen.evaluate_state_actions(obs_next, actions, obs_delta)
@@ -209,7 +218,7 @@ class bw_module:
                 torch.nn.utils.clip_grad_norm_(self.bw_params, self.args.max_grad_norm)
                 self.bw_optimizer.step()
                 avg_loss += total_loss.item()
-            avg_loss /= 20
+            avg_loss /= self.args.epoch
 
             #Now updating the priorities in the PER Buffer. Use Net Value estimates
             if self.args.per_weight:
@@ -220,19 +229,23 @@ class bw_module:
 
             # Train FW - Model
             if self.args.consistency:
-                fstate_log_probs, fstate_entropy = self.bw_stategen.evaluate_state_actions(obs, actions, obs_next)
-                fw_loss = -fstate_log_probs.mean() - self.args.entropy_coef*fstate_entropy
-                # f_mu, f_sigma = self.fw_stategen(obs, actions)
-                # log_probs, dist_entropy = evaluate_mj(f_mu, f_sigma, obs_next)
-                # if self.args.per_weight:
-                #     fw_loss = -torch.mean(log_probs*weights) - self.args.entropy_coef*torch.mean(dist_entropy*weights)
-                # else:
-                #     fw_loss = -torch.mean(log_probs) - self.args.entropy_coef*(dist_entropy.mean())
-                self.fw_optimizer.zero_grad()
-                fw_loss.backward()
-                torch.nn.under.clip_grad_norm_(self.fw_stategen.parameters(), self.args.max_grad_norm)
-                self.fw_optimizer.step()
-                return total_loss.item(), fw_loss.item()
+                f_loss = 0
+                for _ in range(self.args.epoch):
+                    fstate_log_probs, fstate_entropy = self.fw_stategen.evaluate_state_actions(obs, actions, obs_next)
+                    fw_loss = -fstate_log_probs.mean() - self.args.entropy_coef*fstate_entropy
+                    # f_mu, f_sigma = self.fw_stategen(obs, actions)
+                    # log_probs, dist_entropy = evaluate_mj(f_mu, f_sigma, obs_next)
+                    # if self.args.per_weight:
+                    #     fw_loss = -torch.mean(log_probs*weights) - self.args.entropy_coef*torch.mean(dist_entropy*weights)
+                    # else:
+                    #     fw_loss = -torch.mean(log_probs) - self.args.entropy_coef*(dist_entropy.mean())
+                    self.fw_optimizer.zero_grad()
+                    fw_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.fw_stategen.parameters(), self.args.max_grad_norm)
+                    self.fw_optimizer.step()
+                    f_loss += fw_loss.item()
+                f_loss /= self.args.epoch
+                return avg_loss, f_loss
             else:
                 return avg_loss
 
@@ -241,82 +254,88 @@ class bw_module:
         else:
             return 0.0
 
-    # def train_imitation(self, update):
-    #     """
-    #     Do these steps
-    #     1. Generate Recall traces from bw_model
-    #     2. Do imitation learning using those recall traces
-    #     """
-    #     # maintain list of sampled episodes(batchwise) and append to list. Then do Imitation learning simply
-    #     _ , _ , _ , states, _ , _ = self.sample_batch(self.args.num_states*1000)
-    #     if states is not None:
-    #         states_normalized = np.nan_to_num((states-self.obs_next_mean)/self.obs_next_std)
-    #         with torch.no_grad():
-    #             # self.actor_critic requires un-normalized states
-    #             states = torch.tensor(states, dtype=torch.float32)
-    #             states_normalized = torch.tensor(states_normalized, dtype=torch.float32)
-    #             if self.args.cuda:
-    #                 states = states.cuda()
-    #                 states_normalized = states_normalized.cuda()
-    #             value = self.actor_critic.get_value(states, None, None)
-    #             sorted_indices = value.cpu().numpy().reshape(-1).argsort()[-self.args.num_states:][::-1]
-    #         # Select high value states under currect valuation for target states_next
-    #         states_next = states[sorted_indices.tolist()]
-    #         states_next_normalized = states_normalized[sorted_indices.tolist()]
-    #         mb_actions, mb_states_prev = [], []
-    #         # Sample the Traces
-    #         for step in range(self.args.trace_size):
-    #             with torch.no_grad():
-    #                 a_mu = self.bw_actgen(states_next_normalized)
-    #                 a_sigma = torch.ones_like(a_mu)
-    #                 if self.args.cuda:
-    #                     a_sigma = a_sigma.cuda()
-    #                 actions = select_mj(a_mu, a_sigma)
-    #                 # Note these actions are normalized as StateGen takes in normalized actions(they were trained this way)
-    #                 # if self.args.cuda:
-    #                 #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
-    #                 # else:
-    #                 #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32) + torch.tensor(self.actions_mean, dtype=torch.float32)
-    #                 s_mu, s_sigma = self.bw_stategen(states_next_normalized, actions)
-    #                 s_sigma = torch.ones_like(s_mu)
-    #                 # s_t = s_t+1 + Δs_t
-    #                 delta_state = select_mj(s_mu, s_sigma)
-    #                 if self.args.cuda:
-    #                     delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32).cuda() + torch.tensor(self.obs_delta_mean, dtype=torch.float32).cuda()
-    #                 else:
-    #                     delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32) + torch.tensor(self.obs_delta_mean, dtype=torch.float32)
-    #                 states_prev = states_next + delta_state
-    #                 states_next = states_prev
-    #                 #np.nan_to_num not available in torch
-    #                 states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs_delta_mean)/self.obs_next_std)
-    #                 states_next_normalized = torch.tensor(states_next_normalized, dtype=torch.float32)
-    #                 if self.args.cuda:
-    #                     states_next_normalized = states_next_normalized.cuda()
-    #             # Add to list
-    #             mb_actions.append(actions.cpu().numpy())
-    #             mb_states_prev.append(states_prev.cpu().numpy())
-    #         # Begin to do Imitation Learning
-    #         mb_actions = torch.tensor(mb_actions, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
-    #         mb_states_prev = torch.tensor(mb_states_prev, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
-    #         if self.args.cuda:
-    #             mb_actions = mb_actions.cuda()
-    #             mb_states_prev = mb_states_prev.cuda()
-    #         _, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(mb_states_prev, None, None, mb_actions)
-    #         total_loss = -torch.mean(action_log_probs) - self.args.entropy_coef*dist_entropy
-    #         self.optimizer.zero_grad()
-    #         total_loss.backward()
-    #         torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.max_grad_norm)
-    #         self.optimizer.step()
+    def train_imitation(self, update):
+        """
+        Do these steps
+        1. Generate Recall traces from bw_model
+        2. Do imitation learning using those recall traces
+        """
+        # maintain list of sampled episodes(batchwise) and append to list. Then do Imitation learning simply
+        if self.args.per_weight:
+            _ , _ , _ , states, _ , _ = self.sample_batch(self.args.num_states*1000)
+        else:
+            _ , _ , _ , states = self.sample_batch_noper(self.args.capacity)
 
-    #         # Do the Consistency Bit
-    #         if self.args.consistency:
-    #             print('foo')
-    #         else:
-    #             return total_loss.item()
-    #     elif self.args.consistency:
-    #         return 0.0, 0.0
-    #     else:
-    #         return 0.0
+        if states is not None:
+            states_normalized = np.nan_to_num((states-self.obs_next_mean)/self.obs_next_std)
+            with torch.no_grad():
+                # self.actor_critic requires un-normalized states
+                states = torch.tensor(states, dtype=torch.float32)
+                states_normalized = torch.tensor(states_normalized, dtype=torch.float32)
+                if self.args.cuda:
+                    states = states.cuda()
+                    states_normalized = states_normalized.cuda()
+                value = self.actor_critic.get_value(states, None, None)
+                sorted_indices = value.cpu().numpy().reshape(-1).argsort()[-self.args.num_states:][::-1]
+            # Select high value states under currect valuation for target states_next
+            states_next = states[sorted_indices.tolist()]
+            states_next_normalized = states_normalized[sorted_indices.tolist()]
+            mb_actions, mb_states_prev = [], []
+            # Sample the Traces
+            for step in range(self.args.trace_size):
+                with torch.no_grad():
+                    # a_mu = self.bw_actgen(states_next_normalized)
+                    # a_sigma = torch.ones_like(a_mu)
+                    # if self.args.cuda:
+                    #     a_sigma = a_sigma.cuda()
+                    # actions = select_mj(a_mu, a_sigma)
+                    _, actions, _, _ = self.bw_actgen.act(states_next_normalized, None, None)
+                    # Note these actions are normalized as StateGen takes in normalized actions(they were trained this way)
+                    # if self.args.cuda:
+                    #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
+                    # else:
+                    #     actions = actions*torch.tensor(self.actions_std, dtype=torch.float32) + torch.tensor(self.actions_mean, dtype=torch.float32)
+                    # s_mu, s_sigma = self.bw_stategen(states_next_normalized, actions)
+                    # s_sigma = torch.ones_like(s_mu)
+                    delta_state, _ = self.bw_stategen.act(states_next_normalized, actions)
+                    # s_t = s_t+1 + Δs_t
+                    # delta_state = select_mj(s_mu, s_sigma)
+                    if self.args.cuda:
+                        delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32).cuda() + torch.tensor(self.obs_delta_mean, dtype=torch.float32).cuda()
+                    else:
+                        delta_state = delta_state*torch.tensor(self.obs_delta_std, dtype=torch.float32) + torch.tensor(self.obs_delta_mean, dtype=torch.float32)
+                    states_prev = states_next + delta_state
+                    states_next = states_prev
+                    #np.nan_to_num not available in torch
+                    states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs_delta_mean)/self.obs_next_std)
+                    states_next_normalized = torch.tensor(states_next_normalized, dtype=torch.float32)
+                    if self.args.cuda:
+                        states_next_normalized = states_next_normalized.cuda()
+                # Add to list
+                mb_actions.append(actions.cpu().numpy())
+                mb_states_prev.append(states_prev.cpu().numpy())
+            # Begin to do Imitation Learning
+            mb_actions = torch.tensor(mb_actions, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
+            mb_states_prev = torch.tensor(mb_states_prev, dtype=torch.float32).view(self.args.num_states*self.args.trace_size, -1)
+            if self.args.cuda:
+                mb_actions = mb_actions.cuda()
+                mb_states_prev = mb_states_prev.cuda()
+            _, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(mb_states_prev, None, None, mb_actions)
+            total_loss = -torch.mean(action_log_probs) - self.args.entropy_coef*dist_entropy
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.args.max_grad_norm)
+            self.optimizer.step()
+
+            # Do the Consistency Bit
+            if self.args.consistency:
+                print('foo')
+            else:
+                return total_loss.item()
+        elif self.args.consistency:
+            return 0.0, 0.0
+        else:
+            return 0.0
 
     def step(self, obs, actions, rewards, dones, obs_next):
         """
@@ -330,6 +349,15 @@ class bw_module:
                 self.update_buffer(self.running_episodes[n])
                 # Clear the episode buffer
                 self.running_episodes[n] = []
+        # self.buffer._storage.sort(key=lambda x: x[2])
+        if len(self.buffer) >= self.args.capacity -1 :
+            # Buffer is full
+            if self.buffer._next_idx > int(self.args.ratio*self.args.capacity):
+                # Limit reached. Sort and 0
+                self.buffer._storage.sort(key=lambda x: x[2])
+                self.buffer._next_idx = self.buffer._next_idx % int(self.args.ratio*self.args.capacity)
+        # else:
+            # self.buffer._storage.sort(key=lambda x: x[2])
 
     def update_buffer(self, trajectory):
         """
