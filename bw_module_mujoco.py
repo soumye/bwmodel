@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 import random
-# from models_mujoco import ActGen, StateGen
 from model import Policy, StateGen
 from baselines.common.segment_tree import SumSegmentTree, MinSegmentTree
 from utils_bw import select_mj, evaluate_mj, zero_mean_unit_std
@@ -130,7 +129,6 @@ class bw_module:
             self.buffer = PrioritizedReplayBuffer(self.args.capacity, self.args.sil_alpha)
         else:
             self.buffer = ReplayBuffer(self.args.capacity)
-            # self.bufferold = ReplayBuffer(10*self.args.capacity)
         # some other parameters...
         self.total_steps = []
         self.total_rewards = []
@@ -158,10 +156,8 @@ class bw_module:
                 with torch.no_grad():
                     # self.actor_critic requires un-normalized states
                     obs_next_unnormalized = torch.tensor(obs_next_unnormalized, dtype=torch.float32)
-                    # states_normalized = torch.tensor(states_normalized, dtype=torch.float32)
                     if self.args.cuda:
                         obs_next_unnormalized = obs_next_unnormalized.cuda()
-                        # states_normalized = states_normalized.cuda()
                     value = self.actor_critic.get_value(obs_next_unnormalized, None, None)
                     sorted_indices = value.cpu().numpy().reshape(-1).argsort()[-batch_size:][::-1]
                     obs_next_unnormalized = obs_next_unnormalized.cpu().numpy()
@@ -170,8 +166,6 @@ class bw_module:
                 obs_next_unnormalized = obs_next_unnormalized[sorted_indices.tolist()]
                 actions = actions[sorted_indices.tolist()]
                 returns = returns[sorted_indices.tolist()]
-                # for (ob, action, R, ob_next) in list(zip(obs, actions, returns, obs_next_unnormalized)):
-                #     self.buffer_old.add(ob, action, R, ob_next)
 
             obs_delta, self.obs_delta_mean, self.obs_delta_std = zero_mean_unit_std(obs-obs_next_unnormalized)
             actions, self.actions_mean, self.actions_std = zero_mean_unit_std(actions)
@@ -200,14 +194,7 @@ class bw_module:
                 # a_mu = self.bw_actgen(obs_next)
                 _, action_log_probs, action_entropy, _ = self.bw_actgen.evaluate_actions(obs_next, None, None, actions)
                 state_log_probs, state_entropy = self.bw_stategen.evaluate_state_actions(obs_next, actions, obs_delta)
-                # s_mu, s_sigma = self.bw_stategen(obs_next, actions)
-                # s_sigma = torch.ones_like(s_mu)
-                # a_sigma = torch.ones_like(a_mu)
-                # if self.args.cuda:
-                    # a_sigma = a_sigma.cuda()
-                # Calculate Losses. Losses in terms of everything (mu,sigma,actions/obs_delta) noramlized only.
-                # action_log_probs, action_entropy = evaluate_mj(a_mu, a_sigma, actions)
-                # state_log_probs, state_entropy = evaluate_mj(s_mu, s_sigma, obs_delta)
+                # Calculate Losses.
                 entropy_loss = self.args.entropy_coef*(action_entropy+state_entropy)
                 if self.args.per_weight:
                     total_loss = -torch.mean(action_log_probs*weights) - torch.mean(state_log_probs*weights) - entropy_loss
@@ -233,12 +220,6 @@ class bw_module:
                 for _ in range(self.args.epoch):
                     fstate_log_probs, fstate_entropy = self.fw_stategen.evaluate_state_actions(obs, actions, obs_next)
                     fw_loss = -fstate_log_probs.mean() - self.args.entropy_coef*fstate_entropy
-                    # f_mu, f_sigma = self.fw_stategen(obs, actions)
-                    # log_probs, dist_entropy = evaluate_mj(f_mu, f_sigma, obs_next)
-                    # if self.args.per_weight:
-                    #     fw_loss = -torch.mean(log_probs*weights) - self.args.entropy_coef*torch.mean(dist_entropy*weights)
-                    # else:
-                    #     fw_loss = -torch.mean(log_probs) - self.args.entropy_coef*(dist_entropy.mean())
                     self.fw_optimizer.zero_grad()
                     fw_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.fw_stategen.parameters(), self.args.max_grad_norm)
@@ -284,16 +265,11 @@ class bw_module:
             # Sample the Traces
             for step in range(self.args.trace_size):
                 with torch.no_grad():
-                    # a_mu = self.bw_actgen(states_next_normalized)
-                    # a_sigma = torch.ones_like(a_mu)
-                    # if self.args.cuda:
-                    #     a_sigma = a_sigma.cuda()
-                    # actions = select_mj(a_mu, a_sigma)
+                    # a_mu = self.bw_actgen
                     _, actions, _, _ = self.bw_actgen.act(states_next_normalized, None, None)
                     # Note these actions are normalized as StateGen takes in normalized actions(they were trained this way)
-                    # s_mu, s_sigma = self.bw_stategen(states_next_normalized, actions)
-                    # s_sigma = torch.ones_like(s_mu)
                     delta_state, _ = self.bw_stategen.act(states_next_normalized, actions)
+                    # Unnormalize the actions
                     if self.args.cuda:
                         actions = actions*torch.tensor(self.actions_std, dtype=torch.float32).cuda() + torch.tensor(self.actions_mean, dtype=torch.float32).cuda()
                     else:
@@ -307,7 +283,7 @@ class bw_module:
                     states_prev = states_next + delta_state
                     states_next = states_prev
                     #np.nan_to_num not available in torch
-                    states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs__mean)/self.obs_next_std)
+                    states_next_normalized = np.nan_to_num((states_next.cpu().numpy() - self.obs_mean)/self.obs_next_std)
                     states_next_normalized = torch.tensor(states_next_normalized, dtype=torch.float32)
                     if self.args.cuda:
                         states_next_normalized = states_next_normalized.cuda()
@@ -349,15 +325,12 @@ class bw_module:
                 self.update_buffer(self.running_episodes[n])
                 # Clear the episode buffer
                 self.running_episodes[n] = []
-        # self.buffer._storage.sort(key=lambda x: x[2])
         if len(self.buffer) >= self.args.capacity -1 :
             # Buffer is full
             if self.buffer._next_idx > int(self.args.ratio*self.args.capacity):
                 # Limit reached. Sort and 0
                 self.buffer._storage.sort(key=lambda x: x[2])
                 self.buffer._next_idx = self.buffer._next_idx % int(self.args.ratio*self.args.capacity)
-        # else:
-            # self.buffer._storage.sort(key=lambda x: x[2])
 
     def update_buffer(self, trajectory):
         """
